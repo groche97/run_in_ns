@@ -1,6 +1,7 @@
 # README
 This project is thought as a simple example to show how to work with
 network namespaces using the [rtnetlink](https://github.com/rust-netlink/rtnetlink)
+Rust crate.
 
 It will simply try to create a new network namespace and turn up the lo
 interface.
