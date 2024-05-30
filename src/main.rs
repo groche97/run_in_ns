@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: MIT
 
 use futures::TryStreamExt;
+use netlink_packet_core::{
+    NetlinkHeader, NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL,
+    NLM_F_REQUEST,
+};
+use netlink_packet_route::RouteNetlinkMessage;
+use netlink_packet_route::link::{LinkAttribute, LinkFlags, LinkMessage};
+use netlink_sys::{protocols::NETLINK_ROUTE, SocketAddr, Socket};
 use nix::fcntl::{open, OFlag};
 use nix::mount::{mount, MsFlags};
 use nix::sched::{CloneFlags, unshare, setns};
@@ -20,8 +27,7 @@ use std::os::fd::FromRawFd;
 
 static NETNS: &str = "/run/netns/";
 
-#[tokio::main]
-async fn main() -> Result<(), String> {
+fn main() -> Result<(), String> {
 
     env_logger::Builder::from_default_env()
         .format_timestamp_secs()
@@ -30,16 +36,17 @@ async fn main() -> Result<(), String> {
 
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
-        usage();
+        // usage();
+        set_lo_up_netlink().unwrap();
         return Ok(());
     }
     let ns_name = &args[1];
-    run_in_namespace(ns_name).await.unwrap();
+    run_in_namespace(ns_name).unwrap();
 
     Ok(())
 }
 
-pub async fn run_in_namespace(ns_name: &String) -> Result<(), ()> {
+pub fn run_in_namespace(ns_name: &String) -> Result<(), ()> {
     prep_for_fork()?;
     // Configure networking in the child namespace:
     // Fork a process that is set to the newly created namespace
@@ -55,7 +62,7 @@ pub async fn run_in_namespace(ns_name: &String) -> Result<(), ()> {
         Ok(ForkResult::Child) => {
             // Child process
             // Move the child to the target namespace
-            run_child(ns_name).await
+            run_child(ns_name)
         }
         Err(e) => {
             log::error!("Can not fork() for ns creation: {}", e);
@@ -95,8 +102,8 @@ fn run_parent(child: Pid) -> Result<(), ()> {
 
 }
 
-async fn run_child(ns_name: &String) -> Result<(), ()> {
-    let res = split_namespace(ns_name).await;
+fn run_child(ns_name: &String) -> Result<(), ()> {
+    let res = split_namespace(ns_name);
 
     match res {
         Err(_) => {
@@ -110,11 +117,11 @@ async fn run_child(ns_name: &String) -> Result<(), ()> {
     }
 }
 
-async fn split_namespace(ns_name: &String) -> Result<(), ()> {
+fn split_namespace(ns_name: &String) -> Result<(), ()> {
     // First create the network namespace
-    NetworkNamespace::add(ns_name.to_string()).await.map_err(|e| {
-        log::error!("Can not create namespace {}", e);
-    }).unwrap();
+    // NetworkNamespace::add(ns_name.to_string()).map_err(|e| {
+    //     log::error!("Can not create namespace {}", e);
+    // }).unwrap();
 
     // Open NS path
     let ns_path = format!("{}{}", NETNS, ns_name);
@@ -124,7 +131,7 @@ async fn split_namespace(ns_name: &String) -> Result<(), ()> {
     open_flags.insert(OFlag::O_CLOEXEC);
 
     let fd = match open(Path::new(&ns_path), open_flags, Mode::empty()) {
-        Ok(raw_fd) => unsafe { 
+        Ok(raw_fd) => unsafe {
             File::from_raw_fd(raw_fd)
         }
         Err(e) => {
@@ -176,20 +183,96 @@ async fn split_namespace(ns_name: &String) -> Result<(), ()> {
         ()
     }
 
-    set_lo_up().await.unwrap();
+    // set_lo_up().await.unwrap();
+    set_lo_up_netlink().unwrap();
 
     Ok(())
 }
 
-async fn set_lo_up() -> Result<(), Error> {
-    let (connection, handle, _) = new_connection().unwrap();
-    log::debug!("ARE WE STOPPING YET???");
-    let veth_idx = handle.link().get().match_name("lo".to_string()).execute().try_next().await?
-                .ok_or_else(|| log::error!("Can not find lo interface ")).unwrap()
-                .header.index;
-    log::debug!("LO INTERFACE INDEX: {}", veth_idx);
-    handle.link().set(veth_idx).up().execute().await.unwrap();
+// async fn set_lo_up() -> Result<(), Error> {
+//     let (connection, handle, _) = new_connection().unwrap();
+//     log::debug!("ARE WE STOPPING YET???");
+//     let veth_idx = handle.link().get().match_name("lo".to_string()).execute().try_next().await?
+//                 .ok_or_else(|| log::error!("Can not find lo interface ")).unwrap()
+//                 .header.index;
+//     log::debug!("LO INTERFACE INDEX: {}", veth_idx);
+//     handle.link().set(veth_idx).up().execute().await.unwrap();
+//     Ok(())
+// }
+
+fn set_lo_up_netlink() -> Result<(), Error> {
+    let mut msg = LinkMessage::default();
+    msg.attributes.push(LinkAttribute::IfName("test".to_string()));
+    msg.header.flags = LinkFlags::Up;
+    msg.header.change_mask = LinkFlags::Up;
+
+    let result = make_netlink_req(
+        RouteNetlinkMessage::SetLink(msg),
+        NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE
+    ).unwrap();
+
+    log::info!("Length of the result: {}", result.len());
+
     Ok(())
+}
+
+fn make_netlink_req(msg: RouteNetlinkMessage, flags: u16) -> Result<Vec<RouteNetlinkMessage>, ()> {
+    // Bind new socket AF_NETLINK socket with NETLINK_ROUTE as protocol
+    let mut socket = Socket::new(NETLINK_ROUTE).unwrap();
+    let addr = &SocketAddr::new(0, 0);
+    socket.bind(addr).unwrap();
+    socket.connect(addr).unwrap();
+
+    // Send message
+    let mut packet = NetlinkMessage::new(NetlinkHeader::default(), NetlinkPayload::from(msg));
+    packet.header.flags = NLM_F_REQUEST | flags;
+    packet.header.sequence_number = 2;
+
+    let mut buffer = [0; 8192];
+    packet.finalize();
+    packet.serialize(&mut buffer[..]);
+
+    log::debug!("Send netlink packet: {:?}", packet);
+
+    socket.send(&buffer[..packet.buffer_len()], 0).unwrap();
+
+    // Recv from netlink
+    let size = socket.recv(&mut &mut buffer[..], 0).unwrap();
+    log::info!("Received {} bytes, expected {}", size, packet.buffer_len());
+
+    let rx_packet: NetlinkMessage<RouteNetlinkMessage>  =
+        NetlinkMessage::deserialize(&buffer[..]).map_err(|e| {
+            log::error!("Failed to deserialize message: {}", e);
+        }).unwrap();
+
+    log::debug!("Got sequence number {}", rx_packet.header.sequence_number);
+    let mut res = Vec::new();
+    match rx_packet.payload {
+        NetlinkPayload::Done(_) => {
+            log::info!("Status DONE");
+            return Ok(res);
+        }
+
+        NetlinkPayload::Error(e) => {
+            if e.code.is_some() {
+                log::error!("Real Error in message serialization: {e}");
+                return Err(());
+            } else {
+                return Ok(res);
+            }
+        }
+
+        NetlinkPayload::InnerMessage(msg) => {
+            log::info!("Status Inner Message");
+            res.push(msg);
+            return Ok(res);
+        }
+
+        _ => {
+            log::error!("Status not implemented: {:?}", rx_packet.payload);
+            return Err(());
+        }
+    }
 }
 
 
