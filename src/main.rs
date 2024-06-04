@@ -3,11 +3,12 @@
 use futures::TryStreamExt;
 use nix::fcntl::{open, OFlag};
 use nix::mount::{mount, MsFlags};
-use nix::sched::{CloneFlags, unshare, setns};
+use nix::sched::{CloneFlags, clone, unshare, setns};
 use nix::unistd::{fork, ForkResult, Pid};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::sys::stat::Mode;
 use nix::sys::statvfs::{statvfs, FsFlags};
+use nix::sys::signal::Signal;
 use rtnetlink::{new_connection, Error, Handle, NetworkNamespace};
 
 use std::env;
@@ -18,10 +19,10 @@ use std::os::unix::io::RawFd;
 use std::os::fd::FromRawFd;
 
 
-static NETNS: &str = "/run/netns/";
+static NETNS: &str = "/var/run/netns/";
+const STACK_SIZE: usize = 1024 * 1024;
 
-#[tokio::main]
-async fn main() -> Result<(), String> {
+fn main() -> Result<(), String> {
 
     env_logger::Builder::from_default_env()
         .format_timestamp_secs()
@@ -34,87 +35,67 @@ async fn main() -> Result<(), String> {
         return Ok(());
     }
     let ns_name = &args[1];
-    run_in_namespace(ns_name).await.unwrap();
+    run_in_namespace(ns_name).unwrap();
 
     Ok(())
 }
 
-pub async fn run_in_namespace(ns_name: &String) -> Result<(), ()> {
-    prep_for_fork()?;
+pub fn run_in_namespace(ns_name: &String) -> Result<(), ()> {
     // Configure networking in the child namespace:
     // Fork a process that is set to the newly created namespace
     // Here set the veth ip addr, routing tables etc.
     // Unfortunately the NetworkNamespace interface of rtnetlink does
     // not offer these functionalities
-    match unsafe { fork() } {
-        Ok(ForkResult::Parent { child, .. }) => {
-            // Parent process
-            log::debug!("Net configuration PID: {}", child.as_raw());
-            run_parent(child)
-        }
-        Ok(ForkResult::Child) => {
-            // Child process
-            // Move the child to the target namespace
-            run_child(ns_name).await
-        }
-        Err(e) => {
-            log::error!("Can not fork() for ns creation: {}", e);
-            return Err(());
-        }
-    }
+    let mut tmp_stack: [u8; STACK_SIZE] = [0; STACK_SIZE];
+    let mut flags = CloneFlags::empty();
+    flags.insert(CloneFlags::CLONE_VM);
+    flags.insert(CloneFlags::CLONE_VFORK);
 
-}
-
-fn run_parent(child: Pid) -> Result<(), ()> {
-    log::trace!("[Parent] Child PID: {}", child);
-    match waitpid(child, None) {
-        Ok(wait_status) => match wait_status {
-            WaitStatus::Exited(_, res) => {
-                log::trace!("Child exited with: {}", res);
-                if res == 0 {
-                    return Ok(());
-                } else {
-                    log::error!("Child exited with status {}", res);
+    unsafe {
+        match clone(
+            Box::new(|| run_child(&ns_name.clone())),
+            &mut tmp_stack,
+            flags,
+            Some(Signal::SIGCHLD as i32)) {
+                Ok(pid) => Ok(()),
+                Err(e) => {
+                    log::error!("Error in clone : {e}");
                     return Err(());
                 }
             }
-            WaitStatus::Signaled(_, signal, coredump) => {
-                log::error!("Child process killed by signal");
-                return Err(());
-            }
-            _ => {
-                log::error!("Unknown child process status: {:?}", wait_status);
-                return Err(());
-            }
-        }
-        Err(e) => {
-            log::error!("wait error : {}", e);
-            return Err(());
-        }
     }
 
 }
 
-async fn run_child(ns_name: &String) -> Result<(), ()> {
-    let res = split_namespace(ns_name).await;
+fn run_parent(child: Pid) -> isize {
+    log::trace!("[Parent] Child PID: {}", child);
+    if let Err(e) = waitpid(child, None) {
+        log::error!("wait error : {}", e);
+        return -1;
+    }
+    0
+}
+
+fn run_child(ns_name: &String) -> isize {
+    let res = split_namespace(ns_name);
 
     match res {
         Err(_) => {
             log::error!("Child process crashed");
-            std::process::abort()
+            return -1;
         }
         Ok(()) => {
             log::debug!("Child exited normally");
-            exit(0)
+            return 0;
         }
     }
 }
 
-async fn split_namespace(ns_name: &String) -> Result<(), ()> {
+fn split_namespace(ns_name: &String) -> Result<(), ()> {
     // First create the network namespace
-    NetworkNamespace::add(ns_name.to_string()).await.map_err(|e| {
-        log::error!("Can not create namespace {}", e);
-    }).unwrap();
+    // NetworkNamespace::add(ns_name.to_string()).await.map_err(|e| {
+    //     log::error!("Can not create namespace {}", e);
+    // }).unwrap();
 
     // Open NS path
     let ns_path = format!("{}{}", NETNS, ns_name);
@@ -176,28 +157,26 @@ async fn split_namespace(ns_name: &String) -> Result<(), ()> {
         ()
     }
 
-    set_lo_up().await.unwrap();
+    set_lo_up().unwrap();
 
     Ok(())
 }
 
-async fn set_lo_up() -> Result<(), Error> {
-    let (connection, handle, _) = new_connection().unwrap();
-    log::debug!("ARE WE STOPPING YET???");
-    let veth_idx = handle.link().get().match_name("lo".to_string()).execute().try_next().await?
-                .ok_or_else(|| log::error!("Can not find lo interface ")).unwrap()
-                .header.index;
-    log::debug!("LO INTERFACE INDEX: {}", veth_idx);
-    handle.link().set(veth_idx).up().execute().await.unwrap();
+fn set_lo_up() -> Result<(), Error> {
+    tokio::runtime::Runtime::new().unwrap().handle().block_on( async {
+        let (connection, handle, _) = new_connection().unwrap();
+        log::debug!("ARE WE STOPPING YET???");
+        let veth_idx = handle.link().get().match_name("test".to_string()).execute().try_next().await.unwrap()
+                    .ok_or_else(|| log::error!("Can not find lo interface ")).unwrap()
+                    .header.index;
+        log::debug!("LO INTERFACE INDEX: {}", veth_idx);
+        handle.link().set(veth_idx).up().execute().await.unwrap();
+    });
     Ok(())
 }
 
 
 // Cargo cult from the definition in rtnetlink
-fn prep_for_fork() -> Result<(), ()> {
-    Ok(())
-}
-
 fn usage() {
     eprintln!(
         "usage: add_netns <ns_name>"
